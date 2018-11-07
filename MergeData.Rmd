@@ -1,0 +1,167 @@
+---
+title: "Merge meterological and respiration data"
+author: "K Todd-Brown (ktoddbrown@gmail.com)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r setUp, message=FALSE}
+library(tidyverse)
+library(knitr)
+
+sessionInfo()
+```
+
+#Load data
+##Meterological
+```{r loadMet}
+
+load('temp/MetData20170903.RData')
+met.df <- data_addWetL.df
+
+ggplot(met.df, aes(x=Air.temperature, y=Relative.Humidity)) +
+  geom_hex() +
+  facet_wrap(~Location)
+```
+
+##Cumulative hours in wet events
+```{r cumWetHours}
+#Taken from MetData.Rmd
+# compareTime.df <- data_addWetL.df %>%
+#   ungroup() %>% group_by(Location) %>%
+#   summarize(total.hr=sum(duration.hr, na.rm=TRUE),
+#          rain.hr=sum(duration.hr*(Rain > 0), na.rm=TRUE),
+#          highRH.hr=sum(duration.hr*(Relative.Humidity>80), na.rm=TRUE),
+#          wet.hr=sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE),
+#          wet_by_RH.hr=sum(duration.hr*percentWet_byRH, na.rm=TRUE))
+
+cumWet.df <- met.df %>% 
+  arrange(Location, Date) %>%
+  ungroup() %>% group_by(Location)  %>%
+  mutate(duration.hr = if_else(is.na(duration.hr), 0, duration.hr)) %>%
+  mutate(rain.cumHr=cumsum(duration.hr*(is.finite(Rain) & Rain > 0)),
+         highRH.cumHr=cumsum(duration.hr*(Relative.Humidity>80)),
+         wet.cumHr=cumsum(duration.hr*(grepl('wet', Wet.factor))),
+         wet_by_RH.cumHr=cumsum(duration.hr*percentWet_byRH)) %>%
+  select(Location, Date, duration.hr, rain.cumHr, highRH.cumHr, wet.cumHr, wet_by_RH.cumHr) %>%
+  gather(key=wetDef, value=`cum. hours`, 
+         rain.cumHr, highRH.cumHr, wet.cumHr, wet_by_RH.cumHr) %>%
+  mutate(`Wet Definition` = recode(wetDef, rain.cumHr='Rain', highRH.cumHr="RH > 80%", 
+         wet.cumHr="Wetness sensor", wet_by_RH.cumHr="Wet(RH) probability"))
+
+ggplot(cumWet.df) +
+  geom_line(aes(x=Date, y=`cum. hours`, color=`Wet Definition`)) +
+  facet_wrap(~Location, ncol=1)
+```
+
+##Respiration
+```{r loadResp}
+load('temp/RespData.RData')
+
+resp.df <- data.df %>%
+  filter(sterile_non=='nonsterile')
+
+ggplot(resp.df) + geom_histogram(aes(x=Flux_g.C_glitter.1_d.1))
+ggplot(resp.df) + geom_point(aes(x=GravMoist, y=Flux_g.C_glitter.1_d.1)) +
+  geom_vline(xintercept=c(5, 25))
+```
+
+#Extrapolate respiration using met data
+Since we can't see a pattern with temperature or moisture (see RespDataProcessing).
+Since we have the wetness sensor data we are using that to bin dry, slightly wet, and wet conditions.
+We are seperating events triggered by rain vs non-rainfall via wet slopes.
+
+```{r summarizeResp}
+resp.short <- resp.df %>%
+  filter(is.finite(Flux_g.C_glitter.1_d.1)) %>%
+  select(Site_FEDGbbIowa, GravMoist, Flux_g.C_glitter.1_d.1) %>%
+  mutate(Wet.factor = factor(ifelse(GravMoist < 5, 'dry', 
+                             ifelse(GravMoist < 25, 'slightly.wet', 'wet')),
+                             c('dry', 'slightly.wet', 'wet'))) %>%
+  group_by(Wet.factor) %>%
+  summarize(Flux000 = quantile(Flux_g.C_glitter.1_d.1, 0),
+            Flux005 = quantile(Flux_g.C_glitter.1_d.1, 0.05),
+            Flux025 = quantile(Flux_g.C_glitter.1_d.1, 0.25),
+            Flux050 = quantile(Flux_g.C_glitter.1_d.1, 0.50),
+            Flux075 = quantile(Flux_g.C_glitter.1_d.1, 0.75),
+            Flux095 = quantile(Flux_g.C_glitter.1_d.1, 0.95),
+            Flux100 = quantile(Flux_g.C_glitter.1_d.1, 1)) %>%
+  mutate(units='g.C_glitter.1_d.1')
+
+print(select(resp.short, Wet.factor, units, Flux000, Flux050, Flux100))
+
+```
+
+#Calculate resipration range from different definnitions of wet time
+```{r compare}
+wet_respRate <- resp.short %>% filter(Wet.factor == 'wet') %>% select(-Wet.factor, -units)
+
+compareResp.df <- compareTime.df %>% 
+  tidyr::gather(Type, value, -Location, -total.hr) %>% 
+  filter(value > 0) %>% 
+  mutate(Flux000_gC_gLitter.1 = wet_respRate$Flux000*value/24,
+         Flux005_gC_gLitter.1 = wet_respRate$Flux005*value/24,
+         Flux025_gC_gLitter.1 = wet_respRate$Flux025*value/24,
+         Flux050_gC_gLitter.1 = wet_respRate$Flux050*value/24,
+         Flux075_gC_gLitter.1 = wet_respRate$Flux075*value/24,
+         Flux095_gC_gLitter.1 = wet_respRate$Flux095*value/24,
+         Flux100_gC_gLitter.1 = wet_respRate$Flux100*value/24,
+         Location=recode_factor(Location, FED="Namib East", 
+                                GBB="Namib West", IA="Iowa", SEV="Sevilleta"),
+         `Wet Definition`=recode_factor(Type, rain.hr = "Rain",
+                                 highRH.hr="RH > 80%",
+                                 wet.hr="Wetness sensor",
+                                 wet_by_RH.hr ='Wet(RH) probability'))
+
+ggplot(compareResp.df, aes(x=Location, y=value/total.hr, color=`Wet Definition`)) + 
+  geom_point() + geom_line() +
+  labs(x='Location', y='Fraction of total time by hour', 
+       title='Fraction time wet by different definitions') +
+  scale_y_log10()
+
+ggplot(compareResp.df, aes(x=`Wet Definition`, #y=Flux050_gC_gLitter.1,
+                           lower=Flux025_gC_gLitter.1, 
+                           upper=Flux075_gC_gLitter.1, middle= Flux050_gC_gLitter.1,
+                           ymin= Flux005_gC_gLitter.1, ymax=Flux095_gC_gLitter.1)) +
+  geom_boxplot(stat='identity') + 
+  labs(y='C lost over total time period [mass-C %]', x='Wet definition') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~Location, scales='free_y')
+
+#### SE work 18 Jan 2018: Rearranging data to create one simpler graph for main text, and one showing all definitions for supplemental. 
+
+#See NOTE/request for KTB on y-axis units
+
+#New figures Jan 18 2018:
+
+#1) Plot to just look at including NRM+Rain and Rain (Wetness probability), for main text Fig 5
+ggplot(subset(compareResp.df, Type %in% c('rain.hr','wet_by_RH.hr')), 
+       aes(x=`Wet Definition`, #y=Flux050_gC_gLitter.1,
+                           lower=Flux025_gC_gLitter.1, 
+                           upper=Flux075_gC_gLitter.1, middle= Flux050_gC_gLitter.1,
+                           ymin= Flux005_gC_gLitter.1, ymax=Flux095_gC_gLitter.1)) +
+  geom_boxplot(stat='identity') + 
+  #scale_x_discrete(breaks=c("rain.hr", 'wet_by_RH.hr'),
+  #                 labels=c("Rain", 'Rain + NRM')) +
+  labs(y='C lost over total time period [mass-C %]', x='Precipitation type included') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~Location, scales='free_y')
+
+#2) Plot definitions, exclude rain: Wetness sensor, Wetness probability and RH, to show that these estimates all align pretty well (Supplemental)
+ggplot(subset(compareResp.df, Type %in% c("highRH.hr", 'wet.hr', 'wet_by_RH.hr')), 
+       aes(x=`Wet Definition`, #y=Flux050_gC_gLitter.1,
+                           lower=Flux025_gC_gLitter.1, 
+                           upper=Flux075_gC_gLitter.1, middle= Flux050_gC_gLitter.1,
+                           ymin= Flux005_gC_gLitter.1, ymax=Flux095_gC_gLitter.1)) +
+  geom_boxplot(stat='identity') + 
+  labs(y='C lost over total time period [mass-C %]', x='Wet definition for NRM') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~Location, scales='free_y')
+
+
+
+```

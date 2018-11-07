@@ -1,0 +1,778 @@
+---
+title: "Analyse in meterological data"
+author: "K Todd-Brown (ktoddbrown@gmail.com)"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  pdf_document: 
+    toc: yes
+  html_document: 
+    toc: yes
+---
+
+This document is to develope the correlation between meterological variables and leaf wetness to seperate moisture events driven by 1) rain, 2) fog, or 3) non-rainfall moisture.
+
+#Set up
+```{r setUp, message=FALSE}
+library(readxl) #deal with excel data directly
+#library(plyr) #aggregate data
+library(ggplot2) #make plots
+library(reshape2) #cast data from short to long format
+library(knitr) #make pretty tables
+library(lubridate)
+library(GGally)
+library(dplyr)
+
+
+sourceFiles.ls <- list('R/defineSlope.R', 'R/defineEventIndex.R')
+temp <- lapply(sourceFiles.ls, source)
+
+sessionInfo()
+
+## Test
+```
+
+
+#Read in GBB data
+All times are read in at GMT to preserve local diurnal patterns.
+
+```{r GBB}
+metDataFile <- 'data/Gbb/FN GB hour 20150615 20160615.xlsx' 
+
+##Read in units at the start of the table
+GBB.meta <- readxl::read_excel(path=metDataFile, sheet="GB", n_max=3)
+GBB.meta <- as.data.frame(t(GBB.meta[,-1]))
+names(GBB.meta) <- c('variable', 'unit', 'height')
+GBB.meta$name <- gsub(' ', '.', row.names(GBB.meta))
+print(GBB.meta)
+
+##Read in data
+GBB.df <- readxl::read_excel(path=metDataFile, sheet="GB", skip=4, col_names=c('Date', GBB.meta$name),
+                             col_types=c('date', rep('numeric', 7)), na=c("NAN", "INF")) %>%
+  mutate(Date = as.POSIXct(round.POSIXt(Date, units='mins'), tz='GMT'), 
+         Location = 'GBB',
+         CumRain = cumsum(Rain)) %>% 
+  arrange(Date) %>%
+  mutate(duration.hr = c(NA, as.numeric(Date[-1] - Date[-length(Date)], units='hours')))
+
+#Set all GBB 'dry' values to 7999
+GBB.df$Leaf.wetness[abs(GBB.df$Leaf.wetness) >= 7999 | 
+                      is.na(GBB.df$Leaf.wetness) |
+                      GBB.df$Leaf.wetness == -999] <- 7999
+
+rm(GBB.meta)
+```
+
+#Read in FED
+```{r FED}
+FED.df <- read.csv('data/FED/Far_East_met_stat.csv', skip=1, 
+                   col.names= c('ID', 'DateStr', 'Air.temperature.globe', 
+                    "Wind.direction", 'Wind.speed', 'Gust.speed',
+                    'Air.temperature', 'Relative.Humidity')) %>%
+  mutate(Date = as.POSIXct(strptime(as.character(DateStr), 
+                                    format='%m/%d/%y %I:%M:%S %p', tz='GMT'))) %>%
+  select(-ID)
+
+
+
+FED2.df <- read.csv('data/FED/Far_East_20161003.csv', header=TRUE, skip=1, stringsAsFactors=FALSE,
+                    col.names=  c('ID', 'DateStr', 'Time', 'Air.temperature.globe', 
+                    "Wind.direction", 'Wind.speed', 'Gust.speed',
+                    'Air.temperature', 'Relative.Humidity'))
+
+#This file switches between DD/MM/YY and MM/DD/YY several times, not worth sorting hrough
+startDate <- as.POSIXct(strptime(FED2.df$DateStr[1], format='%d/%m/%y'))
+FED2.df$dayOff <- c(0, cumsum(FED2.df$DateStr[-nrow(FED2.df)] != FED2.df$DateStr[-1]))
+FED2.df$DDMMYY <- format(startDate + days(FED2.df$dayOff), format='%d/%m/%y')
+FED2.df$Date <- as.POSIXct(strptime(sprintf('%s %s', FED2.df$DDMMYY, FED2.df$Time), 
+                      format='%d/%m/%y %H:%M:%S'), tz='GMT')#-hours(1)) ##file at GMT+1 to match previous file
+
+FED.df <- rbind(FED.df, FED2.df[, names(FED.df)])
+rm(FED2.df)
+FED.df <- FED.df[order(FED.df$Date),]
+FED.df$MetTimeStamp <- FED.df$Date
+FED.df$Date <- as.POSIXct(round(FED.df$Date, units='hour'))
+#print(range(round(FED.df$Date)))
+
+##Leaf wetness sensor
+FEDlws.df <- read.csv('data/FED/Far_East_LWS.csv', skip=1, 
+                      col.names=c('ID', 'Date', 'Wetness.perc')) %>%
+  mutate(Date = as.POSIXct(strptime(as.character(Date), format='%m/%d/%y %I:%M:%S %p'), tz='GMT')) %>%
+  select(-ID)
+
+#file at GMT+1 but reading in as GMT
+FEDlws2.df <- read.csv('data/FED/Far_East_LWS_20161003.csv', skip=1,
+                       col.names=c('ID', 'DateStr', 'Time', 'Wetness.perc', sprintf('X%d', 1:7)),
+                       stringsAsFactors=FALSE)[,1:4]
+
+#This file switches between DD/MM/YY and MM/DD/YY several times, not worth sorting hrough
+startDate <- as.POSIXct(strptime(FEDlws2.df$DateStr[1], format='%d/%m/%y'))
+FEDlws2.df$dayOff <- c(0, 
+                       cumsum(as.numeric(FEDlws2.df$DateStr[-nrow(FEDlws2.df)] != FEDlws2.df$DateStr[-1]) +
+                                 #we are missing July 7 2016 from the dataset
+                              as.numeric('8/7/16' == FEDlws2.df$DateStr[-nrow(FEDlws2.df)] &
+                                       FEDlws2.df$DateStr[-nrow(FEDlws2.df)] != FEDlws2.df$DateStr[-1])))
+FEDlws2.df$DDMMYY <- format(startDate + days(FEDlws2.df$dayOff), format='%d/%m/%y')
+FEDlws2.df$Date <- as.POSIXct(strptime(sprintf('%s %s', FEDlws2.df$DDMMYY, FEDlws2.df$Time), 
+                format='%d/%m/%y %H:%M:%S'), tz='GMT')
+
+FEDlws.df <- rbind(FEDlws.df, FEDlws2.df[, names(FEDlws.df)])
+rm(FEDlws2.df)
+FEDlws.df <- FEDlws.df[order(FEDlws.df$Date),]
+
+if(any(unique(minute(FED.df$Date)) != 0)) stop('FED Date assumption not met!')
+
+FEDwet.df <- FEDlws.df %>%
+  mutate(shortDate = as.POSIXct(round(Date, units='hours')),
+         offHour = as.numeric(abs(Date-as.POSIXct(round(Date, units='hours'))), units='hours')) %>%
+  group_by(shortDate) %>%
+  summarize(bestTime = Date[which.min(offHour)],
+            selectMinute = offHour[which.min(offHour)])
+
+FEDwet.df <- FEDlws.df %>%
+  filter(Date %in% FEDwet.df$bestTime) %>%
+  mutate(RoundDate = as.POSIXct(round(Date, units='hours'))) %>%
+  dplyr::rename(WetnessSensorTimeStamp=Date) %>%
+  dplyr::rename(Date=RoundDate) %>% unique
+
+##Precip sensor
+##file at GMT+1
+FEDrain.df <- read.csv('data/FED/Far_East precip.csv', skip=1, 
+                         col.names= c('ID', 'Date', 'CumRain', 'Coupler.detached', 'Host.connected',
+                                      'Coupler.attached', 'EOF')) %>%
+  mutate(Date = as.POSIXct(strptime(as.character(Date), format='%m/%d/%y %I:%M:%S %p'), tz='GMT')) %>%
+  select(Date, CumRain) %>%
+  mutate(nearestHour = as.POSIXct(round(Date, units='hour')) )%>%
+  group_by(nearestHour) %>%
+  summarize(BestTimeStamp=as.POSIXct(Date[which.min(abs(Date-nearestHour))]),
+            BestCumRain=CumRain[which.min(abs(Date-nearestHour))]) %>%
+  mutate(Rain = c(0, BestCumRain[-1] - BestCumRain[-length(BestCumRain)])) %>%
+  dplyr::rename(CumRain=BestCumRain, Date=nearestHour, RainTimeStamp=BestTimeStamp)
+
+FED.df <- FED.df %>%
+  merge(FEDwet.df, all=TRUE, by='Date') %>%
+  merge(FEDrain.df, all=TRUE, by='Date') %>%
+  mutate(Location = 'FED') %>%
+  arrange(Date) %>%
+  select(-Air.temperature.globe, -Gust.speed) %>%
+  mutate(duration.hr = c(NA, as.numeric(Date[-1] - Date[-length(Date)], units='hours')))
+
+FED.df$CumRain[is.na(FED.df$CumRain)] <- 0
+
+rm(FEDlws.df, FEDwet.df, FEDrain.df)
+```
+
+#Read in IA
+```{r IA}
+
+##2015 isn't covered in the precip file so let's not read in that information
+# IA2015.df <- read.xlsx2(file='data/IA/1901_Summer_Prairie_Fall 2015.xls', sheetIndex=1, startRow=2, colClasses=c('numeric', 'character', 'character', rep('numeric', 6)))
+# #Personal communciation (Sarah Evans), column names follow same pattern as 2016 
+# names(IA2015.df) <- c('ID', 'Date', 'Time', 'Air.temperature.65cm', 'Relative.Humidity.65cm', 'Wetness.perc.65cm', 'Air.temperature', 'Relative.Humidity', 'Wetness.perc')
+# #Time in GMT-5 or EST according to header
+# IA2015.df$Date <- as.POSIXct(strptime(paste(IA2015.df$Date, IA2015.df$Time), format='%m/%d/%y %H:%M:%S', tz='ETC/GMT-5'))
+# IA2015.df$ID <- NULL
+# IA2015.df$Time <- NULL
+
+IA2016.df <- readxl::read_excel(path='data/IA/1901_Summer_Prairie_2016.xls', 
+                        sheet=1, skip=2,
+                        col_names= c('ID', 'DateStr', 'TimeStr', 'Air.temperature.65cm', 'Relative.Humidity.65cm',
+                      'Wetness.perc.65cm', 'Air.temperature', 'Relative.Humidity',
+                      'Wetness.perc'),
+                        col_types='text') %>%
+  mutate_at(vars(one_of(c('ID', 'Air.temperature.65cm', 'Relative.Humidity.65cm',
+                      'Wetness.perc.65cm', 'Air.temperature', 'Relative.Humidity',
+                      'Wetness.perc'))), as.numeric) %>% #Cast as numeric 'cause reading in numeric throws errors
+  mutate(MetTimeStamp = as.POSIXct(strptime(paste(DateStr, TimeStr), 
+                                      format='%m/%d/%y %H:%M:%S'), tz='GMT')) %>%
+  select(-ID)  %>%
+  mutate(Date = as.POSIXct(round(MetTimeStamp, units='hour'))) %>%
+  group_by(Date) %>%
+  summarize(AT=Air.temperature[which.min(abs(MetTimeStamp-Date))],
+            RH=Relative.Humidity[which.min(abs(MetTimeStamp-Date))],
+            WP = Wetness.perc[which.min(abs(MetTimeStamp-Date))], 
+            MD = MetTimeStamp[which.min(abs(MetTimeStamp-Date))]) %>%
+  dplyr::rename(Air.temperature=AT, Relative.Humidity=RH, Wetness.perc=WP, MetTimeStamp=MD)
+
+IAprecip.df <- readxl::read_excel(path='data/IA/1901_Summer_Precip_2016.xls', sheet=1, skip=2,
+                                  col_names=c('ID', 'DateStr', 'TimeStr', 'Temperature', 'Ext.line.event',
+                        'Host.connected', 'Coupler.detached',	'Coupler.attached', 'EOF'),
+                          col_types='text') %>%
+   mutate_at(vars(one_of(c('ID', 'Temperature'))), as.numeric) %>% #Cast as numeric, reading in numeric errors
+        mutate(Date = as.POSIXct(strptime(paste(DateStr, TimeStr), 
+                                          format='%m/%d/%y %H:%M:%S'), tz='GMT'), 
+#Column E is “events.” Each event is a tip of the “tipping bucket” mechanism inside the rain gauge, and each tip represents 0.2 mm of precip. The “events” accumulate through the record. To measure precip associated with a day or individual storm you simply count the accumulated “tips” and multiply by 0.2 to obtain the total precip in mm.
+              CumRain = as.numeric(gsub(',', '', as.character(Ext.line.event)))*0.2) %>%
+  filter(is.finite(CumRain)) %>%
+  mutate(nearestHour = as.POSIXct(round(Date, units='hour'))) %>%
+  group_by(nearestHour) %>%
+  summarize(BestTimeStamp=as.POSIXct(Date[which.min(abs(Date-nearestHour))]),
+            BestCumRain=CumRain[which.min(abs(Date-nearestHour))]) %>%
+  mutate(Rain = c(0, BestCumRain[-1] - BestCumRain[-length(BestCumRain)])) %>%
+  dplyr::rename(CumRain=BestCumRain, Date=nearestHour, RainTimeStamp=BestTimeStamp)
+
+#IA.df <- rbind.fill(IA2015.df, IA2016.df)
+IA.df <- IA2016.df %>%
+  merge(IAprecip.df, all=TRUE, by='Date') %>%
+  mutate(Location='IA') %>% 
+  arrange(Date) %>%
+  mutate(duration.hr = c(NA, as.numeric(Date[-1] - Date[-length(Date)], units='hours')))
+
+IA.df$Rain[is.na(IA.df$Rain)] <- 0
+IA.df$CumRain[is.na(IA.df$CumRain)] <- 0
+
+rm(IA2016.df, IAprecip.df)
+```
+
+#Read in SEV
+```{r readSEV}
+SEV.df <- read.csv('data/SEV/sev1_meteorology_2011-2015.csv') %>%
+  filter(StationID == 40) %>%
+  select(Year, Julian_Day, Hour, Temp_C, Relative_Humidity, Precipitation, Wind_Dir, Mean_WindSpeed) %>%
+  mutate(DateStr = sprintf('%.4d-%.3d %.2d', Year, Julian_Day, Hour)) %>%
+  mutate(Date = as.POSIXct(DateStr, format='%Y-%j %H', tz='GMT'),
+         Location = 'SEV') %>%
+  dplyr::rename(Air.temperature=Temp_C, Relative.Humidity=Relative_Humidity, Rain=Precipitation,
+         Wind.speed=Mean_WindSpeed, Wind.direction=Wind_Dir) %>%
+  arrange(Date) %>%
+  mutate(duration.hr = c(NA, as.numeric(Date[-1] - Date[-length(Date)], units='hours')))
+
+SEV.df[SEV.df == -999] <- NA
+SEV.df$tempRain <- SEV.df$Rain
+SEV.df$tempRain[is.na(SEV.df$tempRain)] <- 0
+SEV.df$CumRain <- cumsum(SEV.df$tempRain)
+SEV.df$tempRain <- NULL
+```
+
+#Merge data
+```{r mergeData}
+data.df <- bind_rows(FED.df, GBB.df, IA.df, SEV.df) %>%
+  select(Location, Date, duration.hr, Wind.direction, Wind.speed, Air.temperature, Relative.Humidity, 
+         CumRain, Rain, Juvik, Wetness.perc, Leaf.wetness) %>%
+  arrange(Location, Date) %>%
+  mutate(Location = as.factor(Location))
+
+data.df[data.df == -999 | data.df == -888.88] <- NA
+```
+
+#Check variables
+```{r varCheck}
+
+plot.df <- data.df %>%
+  select(-Date, -CumRain, -duration.hr, -Rain) %>%
+  tidyr::gather(variable, value, -Location,na.rm=TRUE)
+
+ggplot(plot.df) + geom_histogram(aes(x=value)) +
+  facet_grid(Location~variable, scales='free')
+
+data.df %>%
+  group_by(Location) %>%
+  summarize(startTime=min(Date),
+         endTime = max(Date),
+         totalRain = max(CumRain),
+         avgDuration=mean(duration.hr, na.rm=TRUE),
+         totalIrregularTime.hr=sum(duration.hr[duration.hr != 1], na.rm=TRUE)) %>% print
+```
+
+#Plot noon wetness on days without rain
+```{r noon}
+
+noon.df <- data.df %>%
+  filter(Air.temperature > -100 & Relative.Humidity >0) %>% 
+  mutate(shortDay = as.POSIXct(trunc(Date, units='days')),
+        shortHour = hour(Date)) %>%
+  group_by(Location, shortDay) %>%
+  summarize(dailyRain = sum(Rain, na.rm=TRUE),
+            Wetness.perc = Wetness.perc[which.min(abs(shortHour - 12))],
+            Leaf.wetness = Leaf.wetness[which.min(abs(shortHour - 12))],
+            Relative.Humidity = Relative.Humidity[which.min(abs(shortHour - 12))],
+            Air.temperature = Air.temperature[which.min(abs(shortHour - 12))]) %>%
+  filter(dailyRain == 0)
+
+ggplot(subset(noon.df, Location == 'GBB')) + 
+  geom_point(aes(x=Leaf.wetness, y=Relative.Humidity, color=Air.temperature)) + 
+  facet_wrap(~Location)
+ggsave('temp/LeafWetness_NoonWet.pdf')
+
+ggplot(subset(noon.df, Location %in% c('FED', 'IA'))) + 
+  geom_point(aes(x=Wetness.perc, y=Relative.Humidity, color=Air.temperature)) + 
+  scale_x_log10() +
+  facet_wrap(~Location)
+ggsave('temp/WetnessPerc_NoonWet.pdf')
+
+
+```
+
+#Set wet factor
+```{r setWet}
+
+#If the Leaf.wetness is below (yes below) 150, or above Wetness.perc 10% then it is wet 
+data.df$Wet.factor <- with(data.df, 
+                           factor(ifelse(Location == 'FED', #use wetness.perc
+                                         ifelse(is.na(Wetness.perc), NA, 
+                                                ifelse(Wetness.perc > 10, 'wet',
+                                                       ifelse(Wetness.perc > 2.5, 'slightly wet', 'dry'))),
+                                         ifelse(Location == 'GBB', #use Leaf.wetness
+                                                ifelse(Leaf.wetness == 7999, 'dry',
+                                                       ifelse(Leaf.wetness < 150, 'wet', 'slightly wet')),
+                                                ifelse(Location == 'IA',
+                                                       ifelse(is.na(Wetness.perc), NA, 
+                                                              ifelse(Wetness.perc > 25, 'wet',
+                                                                     #ifelse(Wetness.perc > 12, 'slightly wet',
+                                                                     'dry')),
+                                                NA))),
+             levels=c('dry', 'slightly wet', 'wet')))
+
+ggplot(subset(data.df, Location %in% c('FED', 'IA'))) + 
+  geom_histogram(aes(x=Wetness.perc, fill=Wet.factor, y=..density..), alpha=0.5) +
+  facet_grid(~Location)
+ggplot(subset(data.df, Location %in% c('GBB'))) + 
+  geom_histogram(aes(x=Leaf.wetness, fill=Wet.factor, y=..density..), alpha=0.5) +
+  scale_x_log10() +
+  facet_grid(~Location)
+
+```
+
+# Define events
+## Define event start by 2hr >90% and end by <90% relative humidity
+```{r countEventsByRHThreshold}
+RH_threshold <- 90
+
+data.df <- data.df %>%
+  arrange(Location, Date) %>%
+  group_by(Location) %>%
+  mutate(wetRH=is.finite(Relative.Humidity) & Relative.Humidity >= RH_threshold,
+         dryRH=is.finite(Relative.Humidity) & Relative.Humidity < RH_threshold) %>%
+  mutate(RHtwoHrStart = wetRH & #currently above 90
+           c(FALSE, dryRH[-length(wetRH)]) & #previously not above 90
+           c(wetRH[-1], FALSE), #next is above 90
+         RHdrop = dryRH & #currently dry
+           c(FALSE, wetRH[-length(wetRH)]) & 
+           c(FALSE, FALSE, wetRH[-length(wetRH)+0:1]) #previously wet for 2 hrs
+         ) %>% 
+  mutate(EventIndex.byRHThreshold = cumsum(RHtwoHrStart | RHdrop)) %>%
+  ungroup() %>%
+  select(-wetRH, -dryRH, -RHtwoHrStart, -RHdrop)
+  
+ggplot(data.df) + 
+  geom_line(aes(x=Date, y=EventIndex.byRHThreshold)) + 
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+ggplot(data.df[500+10:50,], aes(x=Date, y=Relative.Humidity)) + 
+  geom_line(aes(color=as.factor(EventIndex.byRHThreshold))) +
+  geom_point()+
+  geom_hline(yintercept=RH_threshold) +
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+```
+## Define events by recorded wet factor and Rain
+```{r countEventsByWet_Rain}
+data.df <- data.df %>%
+  group_by(Location) %>%
+  mutate(wetStart.Rain = is.finite(Rain) & Rain > 0 & #currently raining
+           c(TRUE, (is.na(Rain) | Rain == 0)[-length(Rain)]), #previously not raining
+         dryEnd.Rain = (is.na(Rain) | Rain == 0) & #currently not raining
+           c(TRUE, (is.finite(Rain) & Rain > 0)[-length(Rain)]), #previously raining
+         wetStart.wf = grepl('wet', as.character(Wet.factor)) & #currently wet
+           c(TRUE, grepl('dry', as.character(Wet.factor[-length(Wet.factor)]))), #previously dry
+         dryEnd.wf= grepl('dry', as.character(Wet.factor)) & #currently dry
+           c(TRUE, grepl('wet', as.character(Wet.factor[-length(Wet.factor)])))) %>% #previously wet) %>%
+  mutate(EventIndex.byRain = cumsum(wetStart.Rain | dryEnd.Rain),
+         EventIndex.byWetFactor = cumsum(wetStart.wf | dryEnd.wf)) %>%
+  ungroup() %>%
+  select(-wetStart.Rain, -dryEnd.Rain, -wetStart.wf, -dryEnd.wf)
+
+data.df[data.df$Location == 'SEV', 'EventIndex.byWetFactor'] <- NA
+
+ggplot(data.df) + 
+  geom_line(aes(x=Date, y=EventIndex.byWetFactor)) + 
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+ggplot(data.df) + 
+  geom_line(aes(x=Date, y=EventIndex.byRain)) + 
+  facet_wrap(~Location, ncol=1, scales='free_y')
+```
+
+##Define events by wetness slope
+
+```{r countEventsByWetSlope}
+data.df <- data.df %>%
+  arrange(Location, Date) %>%
+  group_by(Location) %>%
+  mutate(wet.slope = ifelse(is.finite(Wetness.perc), 
+                            defineSlope(x=signif(Wetness.perc, digits=2)),
+                            ifelse(is.finite(Leaf.wetness), 
+                                   defineSlope(x = signif(-1*Leaf.wetness, digits=2)), NA))) %>%
+  mutate(EventIndex.byWetSlope = defineEventIndex(wet.slope))
+
+data.df[data.df$Location == 'SEV', 'EventIndex.byWetSlope'] <- NA
+```
+```{r countEventsByWetSlope_plots}
+#450:500
+ggplot(data.df[500-50:-50,], aes(x=Date, y=Wetness.perc,
+                                color=as.factor(EventIndex.byWetSlope))) + 
+  geom_point(aes(shape=wet.slope)) +geom_line()
+
+ggplot(data.df[500+10:50,], aes(x=Date, y=Wetness.perc,
+                                color=as.factor(EventIndex.byWetSlope))) + 
+  geom_point(aes(shape=wet.slope)) +geom_line()
+
+
+ggplot(data.df[500+10:50,], aes(x=Date, y=Relative.Humidity)) + 
+  geom_line(aes(color=as.factor(EventIndex.byWetSlope))) +
+  geom_point()+
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+ggplot(data.df[is.finite(data.df$Wetness.perc),], aes(x=Relative.Humidity, y=Wetness.perc)) + 
+  geom_point()+
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+
+ggplot(data.df[is.finite(data.df$Leaf.wetness),], aes(x=Relative.Humidity, y=-1*Leaf.wetness)) + 
+  geom_point(alpha=0.05)+
+  facet_wrap(~Location, ncol=1, scales='free_y')
+
+ggplot(subset(data.df, Location == 'GBB')[200:250,]) + 
+  geom_line(aes(x=Date, y=-1*Leaf.wetness,
+                color=as.factor(EventIndex.byWetSlope))) + 
+  geom_point(aes(x=Date, y=-1*Leaf.wetness,
+                color=as.factor(EventIndex.byWetSlope), shape=wet.slope)) + 
+  geom_hline(yintercept=-150)
+  #scale_y_log10()
+
+ggplot(subset(data.df, Location != 'SEV')) + geom_line(aes(x=Date, y=EventIndex.byWetSlope)) + facet_wrap(~Location, ncol=1, scales='free_y')
+```
+
+##ID event types by different indecies
+```{r compareIndex}
+plot.df <- data.df %>% select(Location, contains('EventIndex'))
+
+GGally::ggpairs(plot.df, columns=2:5, ggplot2::aes(color=Location, alpha=0.1))
+```
+
+# Tally lengths by event types
+```{r characterizeEvents}
+
+events.df <- data.df %>% 
+  select(Date, Location, duration.hr, Wet.factor, Rain, Juvik, Relative.Humidity, Air.temperature,
+         EventIndex.byRain, EventIndex.byWetFactor, EventIndex.byRHThreshold, EventIndex.byWetSlope) %>% 
+  dplyr::rename(byRain=EventIndex.byRain, WetFactor=EventIndex.byWetFactor,
+                RHThreshold=EventIndex.byRHThreshold, WetSlope=EventIndex.byWetSlope) %>%
+  tidyr::gather(EventDefined, index, byRain, WetFactor, RHThreshold, WetSlope) %>%
+  group_by(Location, EventDefined, index) %>%
+  dplyr::summarise(
+            EventDuration.hr=sum(duration.hr, na.rm=TRUE), 
+            DryCount = sum(as.character(Wet.factor) %in% 'dry', na.rm=TRUE),
+            FiniteWFCount = sum(is.finite(Wet.factor)),
+            Rain=sum(Rain, na.rm=TRUE),
+            RainStatus=ifelse(any(is.finite(Rain) & Rain > 0), 'Rain', 'NoRain'),
+            FogStatus=ifelse(all(is.finite(Juvik)), ifelse(any(Juvik > 0), 'Fog', 'NoFog'), 'NA'),
+          startTime=min(Date), endTime=max(Date),
+          avgRH = mean(Relative.Humidity, na.rm=TRUE),
+          avgT = mean(Air.temperature, na.rm=TRUE)) %>%
+  mutate(DryPercent=ifelse(FiniteWFCount==0, NA, DryCount/FiniteWFCount)) %>%
+  filter(is.finite(index))
+
+#checkHrs <- data.df %>% group_by(Location) %>% summarize(time.hr=sum(duration.hr, na.rm=TRUE))
+#checkHrs2 <- events.df %>% group_by(Location, EventDefined)  %>% summarize(time.hr=sum(EventDuration.hr, na.rm=TRUE))
+
+```
+
+## How many hours wet
+```{r countHours}
+
+events.df <- events.df %>%
+  mutate(Type = as.factor(ifelse(EventDefined == 'byRain', 
+                       ifelse(RainStatus == 'Rain', 'Wet', 'Dry'), #define rain events by rain presence
+                       ifelse(EventDefined == 'WetFactor', #define wet.factor by wet.factor status
+                              ifelse(is.na(DryPercent),NA, ifelse(DryPercent ==  1, 'Dry', 'Wet')),
+                              ifelse(EventDefined == 'RHThreshold',  #define high RH by averate RH
+                                     ifelse(round(avgRH) >= 90, 'Wet', 'Dry'),
+                                     ifelse(EventDefined == 'WetSlope', #define slope by % wet.factor
+                                            ifelse(is.na(DryPercent),
+                                                   NA,  
+                                                   ifelse(DryPercent > 0.8, 'Dry', 'Wet'))))))))  %>%
+  #assign rain vs NRM event triggers
+  mutate(Trigger = ifelse(Type == 'Dry', 'NA', ifelse(RainStatus == 'NoRain', 'NRM', 'Rain'))) 
+
+wetHours <- events.df %>% 
+  filter(Type == 'Wet') %>%
+  group_by(Location, EventDefined, Trigger) %>%
+  summarize(duration.hr=sum(EventDuration.hr)) %>%
+  tidyr::spread(EventDefined, duration.hr)
+
+kable(wetHours)
+
+```
+  
+  
+```{r WetEventDurations}
+ggplot(subset(events.df, Type=='Wet'), 
+       aes(x=EventDuration.hr, fill=Trigger))+
+  geom_density(aes(y=..count..), alpha=0.5) +
+         facet_grid(EventDefined~Location, scales='free') +
+  scale_x_log10()+
+  labs(title='Duration of wet events')
+
+#####
+#SE graphing duration histogram figure for Manuscript with sites combined, and with one definition (Wet Slope?)
+ggplot(subset(events.df, Type=='Wet' 
+              & EventDefined=="RHThreshold"),  #Thought we should pick one to go forward with- I picked WetSlope
+       aes(x=EventDuration.hr, fill=Trigger))+
+  #geom_density(aes(y=..count..), alpha=0.5) +
+  geom_density(alpha = 0.2)+
+  facet_grid(~Location, scales='free') +
+  #scale_x_log10()+
+  labs(title='Duration of wet events', x='Duration (hour)') +
+  xlim(c(0,24))
+
+# Try plotting with RH threshold definition, looking at FED and GBB, there is something wrong. I cannot seem to identify the problematic datapoints..
+
+#this does not look right! Rain events are rarely this long except maybe in Iowa. Also, did we not exclude "events" less than 2 hours?
+##KTB: While it might not rain for more then 2hours the moisture event associated with that rainfall is longer according to this analysis so it's listed as a 'rain' event according to this definition.
+
+#Temperature histogram
+ggplot(events.df %>% filter(Type=='Wet', EventDefined=="WetSlope"), 
+       aes(x=avgT, fill=Trigger)) +
+  geom_density(alpha=0.2) +
+  facet_grid(~Location, scales='free') +
+  #scale_x_log10()+
+  labs(title='Average temperature of wet events', x='Air Temperature (C)') 
+
+
+#Numbers estimates
+events.df %>% 
+  filter(Type=='Wet', EventDefined=="WetSlope") %>%
+  group_by(Location, Trigger) %>%
+  summarize(meanT=mean(avgT, na.rm=TRUE), sdT=sd(avgT, na.rm=TRUE),
+            meanDuration=mean(EventDuration.hr, na.rm=TRUE), sdDuration=sd(EventDuration.hr, na.rm=TRUE))
+```
+
+# Relative humidity frequency by event type
+```{r RHFreqByEvent}
+
+RHbyEvents.df <- data.df %>% 
+  select(Date, Location, duration.hr, Wet.factor, Rain, Juvik, Relative.Humidity,
+         EventIndex.byRain, EventIndex.byWetFactor, EventIndex.byRHThreshold, EventIndex.byWetSlope) %>% 
+  dplyr::rename(byRain=EventIndex.byRain, WetFactor=EventIndex.byWetFactor,
+                RHThreshold=EventIndex.byRHThreshold, WetSlope=EventIndex.byWetSlope) %>%
+  tidyr::gather(EventDefined, index, byRain, WetFactor, RHThreshold, WetSlope) %>%
+  merge(events.df[,c('Location', 'EventDefined', 'index', 'DryPercent', 'Type', 'Trigger')], 
+        all=TRUE, by=c('Location', 'EventDefined', 'index')) %>%
+  rename(Event.DryPercent=DryPercent, Event.Type=Type, Event.Trigger=Trigger) %>%
+  arrange(Location, EventDefined, Date)
+
+ggplot(RHbyEvents.df, aes(x=Relative.Humidity, fill=Event.Trigger)) + 
+  geom_density(alpha=0.5) +
+  coord_cartesian(ylim=c(0, 0.1)) +
+  facet_grid(Location ~ EventDefined)
+
+```
+
+##Generate probabilities of wet/dry based on RH without Rain
+```{r probRH}
+
+RHcuts <- seq(0, 100, by=4)
+RHprob.df <- RHbyEvents.df %>%
+  filter(Event.Trigger %in% c('NA', 'NRM'), Location != 'SEV') %>% 
+  mutate(Relative.Humidity_bin=cut(Relative.Humidity, breaks=RHcuts, labels=FALSE),
+         Wet.factor_short=ifelse(grepl('wet', Wet.factor), 'Wet', 
+                                 ifelse(grepl('dry', Wet.factor), 'Dry', 'NA'))) %>%
+  group_by(Location, EventDefined, Wet.factor_short, Relative.Humidity_bin) %>%
+  tally %>%
+  filter(n > 10) %>%
+  ungroup() %>% group_by(Location, EventDefined, Relative.Humidity_bin) %>%
+  mutate(percentTot = n/sum(n),
+         min_RH = RHcuts[Relative.Humidity_bin], 
+         max_RH = RHcuts[Relative.Humidity_bin+1]) %>% 
+  mutate(mean_RH=(min_RH+max_RH)/2)
+
+#To include in supplemental - showing robustness across sites and definitions
+ggplot(subset(RHprob.df, Relative.Humidity_bin > (length(RHcuts)/2))) +
+  geom_line(aes(x=mean_RH, y=percentTot, color=Wet.factor_short)) +
+  facet_grid(Location~EventDefined, scales='free') +
+  labs(x='Relative humidity (%)', 
+       y='Leaf wetness likelihood (%)', colour="Wet/Dry factor")
+#Is y-axis a likelihood or an actual wetness?
+
+thresholds.df <- RHprob.df %>%
+  filter(Wet.factor_short == 'Wet') %>%
+  ungroup() %>% group_by(Location, EventDefined) %>%
+  summarize(bin_RH = Relative.Humidity_bin[which.min(abs(percentTot-0.5))]) %>%
+  ungroup() %>%
+  mutate(min_RH = RHcuts[bin_RH], max_RH = RHcuts[bin_RH+1]) %>%
+  mutate(mean_RH = (min_RH+max_RH)/2)
+
+kable(thresholds.df)
+
+likelihood.df <- RHprob.df %>%
+  filter(Wet.factor_short == 'Wet', is.finite(Relative.Humidity_bin)) %>%
+  ungroup() %>% group_by(Relative.Humidity_bin) %>%
+  summarize(percentWet = mean(percentTot)) %>%
+  mutate(min_RH = RHcuts[Relative.Humidity_bin], 
+         max_RH = RHcuts[Relative.Humidity_bin+1])%>% 
+  mutate(mean_RH=(min_RH+max_RH)/2)
+
+likelihood.df <- rbind(likelihood.df,
+                       data.frame(Relative.Humidity_bin=1:min(likelihood.df$Relative.Humidity_bin),
+                                  percentWet=0, 
+                                  min_RH=0, 
+                                  max_RH=min(likelihood.df$min_RH),
+                                  mean_RH=min(likelihood.df$min_RH)/2))
+
+ggplot(likelihood.df, aes(x=mean_RH, y=percentWet)) +
+  geom_line() + geom_point() +
+  labs(x='Relative humidity', y='Percent wet (with removed rain events)', 
+       title='Likelihood wet across all locations and event definitions')
+```
+
+##Compare wet times
+```{r compareWet}
+data_addWetL.df <- data.df %>%
+  mutate(Relative.Humidity_bin = cut(Relative.Humidity, breaks=RHcuts, labels=FALSE)) %>%
+  merge(likelihood.df[,c('Relative.Humidity_bin', 'percentWet')]) %>%
+  rename(percentWet_byRH=percentWet) %>%
+  select(-Relative.Humidity_bin) %>%
+  arrange(Location, Date)
+
+compareTime.df <- data_addWetL.df %>%
+  ungroup() %>% group_by(Location) %>%
+  summarize(total.hr=sum(duration.hr, na.rm=TRUE),
+         rain.hr=sum(duration.hr*(Rain > 0), na.rm=TRUE),
+         highRH.hr=sum(duration.hr*(Relative.Humidity>80), na.rm=TRUE),
+         wet.hr=sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE),
+         wet_by_RH.hr=sum(duration.hr*percentWet_byRH, na.rm=TRUE))
+
+kable(compareTime.df)
+```
+
+#Duration
+```{r}
+dayData.df <- data.df %>%
+  mutate(Day = yday(Date), Year=year(Date), agg='Day') %>%
+  group_by(Location, Day, Year, agg) %>%
+  summarize(duration.day=sum(duration.hr, na.rm=TRUE)/24, 
+            mean.temperature=mean(Air.temperature, na.rm=TRUE), 
+            min.temeprature=min(Air.temperature, na.rm=TRUE),
+            max.temeprature=min(Air.temperature, na.rm=TRUE),
+            mean.RH=mean(Relative.Humidity, na.rm=TRUE),
+            min.RH=min(Relative.Humidity, na.rm=TRUE),
+            max.RH=max(Relative.Humidity, na.rm=TRUE),
+            CumRain=max(CumRain, na.rm=TRUE),
+            Rain=sum(Rain, na.rm=TRUE),
+            Juvik.hr=sum(duration.hr*(Juvik > 0)),
+            Wet.hr=ifelse(all(is.na(Wet.factor)), 
+                          NA, sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE)))
+
+weekData.df <- data.df %>%
+  mutate(Week = week(Date), Year=year(Date), agg='Week') %>%
+  group_by(Location, Week, Year, agg) %>%
+  summarize(duration.day=sum(duration.hr, na.rm=TRUE)/24, 
+            mean.temperature=mean(Air.temperature, na.rm=TRUE), 
+            min.temeprature=min(Air.temperature, na.rm=TRUE),
+            max.temeprature=min(Air.temperature, na.rm=TRUE),
+            mean.RH=mean(Relative.Humidity, na.rm=TRUE),
+            min.RH=min(Relative.Humidity, na.rm=TRUE),
+            max.RH=max(Relative.Humidity, na.rm=TRUE),
+            CumRain=max(CumRain, na.rm=TRUE),
+            Rain=sum(Rain, na.rm=TRUE),
+            Juvik.hr=sum(duration.hr*(Juvik > 0)),
+            Wet.hr=ifelse(all(is.na(Wet.factor)), 
+                          NA, sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE)))
+
+monthData.df <- data.df %>%
+  mutate(Month = month(Date), Year=year(Date),agg='Month') %>%
+  group_by(Location, Month, Year, agg) %>%
+  summarize(duration.day=sum(duration.hr, na.rm=TRUE)/24, 
+            mean.temperature=mean(Air.temperature, na.rm=TRUE), 
+            min.temeprature=min(Air.temperature, na.rm=TRUE),
+            max.temeprature=min(Air.temperature, na.rm=TRUE),
+            mean.RH=mean(Relative.Humidity, na.rm=TRUE),
+            min.RH=min(Relative.Humidity, na.rm=TRUE),
+            max.RH=max(Relative.Humidity, na.rm=TRUE),
+            CumRain=max(CumRain, na.rm=TRUE),
+            Rain=sum(Rain, na.rm=TRUE),
+            Juvik.hr=sum(duration.hr*(Juvik > 0)),
+            Wet.hr=ifelse(all(is.na(Wet.factor)), 
+                          NA, sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE)))
+
+yearData.df <- data.df %>%
+  mutate(Year=year(Date), agg='Year') %>%
+  group_by(Location, Year, agg) %>%
+  summarize(duration.day=sum(duration.hr, na.rm=TRUE)/24, 
+            mean.temperature=mean(Air.temperature, na.rm=TRUE), 
+            min.temeprature=min(Air.temperature, na.rm=TRUE),
+            max.temeprature=min(Air.temperature, na.rm=TRUE),
+            mean.RH=mean(Relative.Humidity, na.rm=TRUE),
+            min.RH=min(Relative.Humidity, na.rm=TRUE),
+            max.RH=max(Relative.Humidity, na.rm=TRUE),
+            CumRain=max(CumRain, na.rm=TRUE),
+            Rain=sum(Rain, na.rm=TRUE),
+            Juvik.hr=sum(duration.hr*(Juvik > 0)),
+            Wet.hr=ifelse(all(is.na(Wet.factor)), 
+                          NA, sum(duration.hr*(grepl('wet', Wet.factor)), na.rm=TRUE)))
+
+aggData <- data.df %>% 
+  mutate(agg='Hour', Wet.hr=ifelse(grepl('wet', Wet.factor), duration.hr, 0), 
+         Juvik.hr=ifelse(is.na(Juvik), NA, ifelse(Juvik>0, duration.hr, 0)),
+         duration.day=duration.hr/24, Rain=ifelse(is.na(Rain), 0, Rain)) %>%
+  rename(mean.RH=Relative.Humidity, mean.temperature=Air.temperature, 
+         Hour=Date) %>%
+  select(Location, agg, Wet.hr, Juvik.hr, duration.day, mean.RH, mean.temperature, Hour, CumRain, Rain) %>%
+  bind_rows(dayData.df, weekData.df, monthData.df, yearData.df) %>%
+  mutate(agg=factor(agg, levels=c('Hour', 'Day', 'Week', 'Month', 'Year')),
+         hasRain = ifelse(Rain > 0, 'Rain', 'NoRain')) 
+```
+
+```{r timeComp}
+ggplot(subset(data.df, grepl('wet', Wet.factor))) +
+  geom_density(aes(x=Relative.Humidity, color=Location)) +
+  labs(title='Hour wet sensor is active')
+
+ggplot(subset(aggData, Location != 'SEV')) +
+  geom_jitter(aes(y=Wet.hr/duration.day, x=mean.RH, color=Location)) +
+  facet_grid(hasRain~agg)#, ncol=1)
+  
+triggerHours <- aggData %>%
+  filter(Location != 'SEV') %>%
+  group_by(Location, agg, hasRain) %>%
+  summarize(Wet.hr = sum(Wet.hr, na.rm=TRUE), duration.day=sum(duration.day, na.rm=TRUE)) %>% 
+  group_by(Location, agg) %>%
+  mutate(totalWet.hr = sum(Wet.hr))
+
+trueWet <- data_addWetL.df %>%
+  group_by(Location, EventIndex.byWetSlope) %>%
+  summarize(tempWet.hr=sum(duration.hr[grepl('wet', Wet.factor)], na.rm=TRUE), 
+         hasRain=ifelse(any(is.finite(Rain) & Rain>0), 'Rain', 'NoRain')) %>%
+  group_by(Location, hasRain) %>%
+  summarize(Wet.hr=sum(tempWet.hr)) %>%
+  group_by(Location) %>%
+  mutate(totalWet.hr = sum(Wet.hr))
+
+ggplot(triggerHours, aes(x=agg, y=Wet.hr, color=as.factor(Location), group=Location)) +
+  geom_line() +geom_point() + 
+  geom_hline(data=trueWet, aes(yintercept=Wet.hr, color=as.factor(Location)), linetype=2) +
+  scale_y_log10() + 
+  facet_wrap(~hasRain) +
+  labs(x='Temporal aggregation level', y='Hours wet', 
+       title='Hours wet attributed to rain events')
+
+ggplot(triggerHours, aes(x=agg, y=Wet.hr/totalWet.hr, color=as.factor(Location), group=Location)) +
+  geom_line() +geom_point() + 
+  geom_hline(data=trueWet, aes(yintercept=Wet.hr/totalWet.hr, color=as.factor(Location)), linetype=2) +
+  scale_y_log10() + 
+  facet_wrap(~hasRain) +
+  labs(x='Temporal aggregation level', y='Fraction of wet hours', 
+       title='Hours wet attributed to rain events')
+```
+#Save data
+```{r saveData}
+save(data_addWetL.df, compareTime.df, file='temp/MetData20170903.RData')
+```
+
+#Helper functions
+```{r, comment=''}
+for(xx in sourceFiles.ls){
+  print(readLines(xx))
+}
+
+```

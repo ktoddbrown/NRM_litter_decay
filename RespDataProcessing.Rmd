@@ -1,0 +1,80 @@
+---
+title: "Respiration data processing"
+author: "K Todd-Brown (ktoddbrown@gmail.com)"
+date: "`r format(Sys.time(), '%d %B, %y')`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+#Prep and load data
+```{r setUp}
+library(ggplot2)
+```
+
+```{r metaDataRead}
+cat(paste(readLines(con="data/Metadata_Complete_Jan5.txt"), '\n'))
+```
+
+```{r loadData}
+data.df <- read.csv('data/FinalData_Resp_Jan6.csv')
+data.df$time <- strptime(paste(as.character(data.df$Date_indiv_reading), as.character(data.df$Time_reading_formatted)), '%m/%d/%y %H:%M', tz='GMT')
+data.df$time <- as.POSIXct(data.df$time)
+
+data.df$RH <- as.numeric(as.character(data.df$RH))
+data.df$Wetness_cont <- as.numeric(as.character(data.df$Wetness_cont))
+save(data.df, file='temp/RespData.RData')
+```
+
+#Plots
+
+##Gravametric moisture predictors
+```{r}
+ggplot(data.df) + geom_point(aes(x=TempC, y=GravMoist))
+
+```
+
+##Flux 
+```{r basicPlots}
+ggplot(data.df) + geom_point(aes(x=time, y=Flux_g.C_glitter.1_d.1)) + facet_wrap(~Event.name, scales='free_x')
+```
+
+##Flux by temperature and gravametric moisture
+```{r}
+ggplot(data.df) + geom_point(aes(x=GravMoist, y=Flux_g.C_glitter.1_d.1,  color=TempC)) + facet_wrap(~Portion.of.curve, ncol=1)
+ggplot(data.df) + geom_point(aes(x=TempC, y=Flux_g.C_glitter.1_d.1, color=GravMoist)) + facet_wrap(~Portion.of.curve, ncol=1)
+```
+
+##Flux by litter type and site
+```{r}
+ggplot(data.df) + geom_point(aes(x=TempC, y=Flux_g.C_glitter.1_d.1, color=GravMoist)) + facet_wrap(~Litt_type, ncol=1)
+ggplot(data.df) + geom_point(aes(x=GravMoist, y=Flux_g.C_glitter.1_d.1, color=TempC)) + facet_wrap(~Litt_type, ncol=1)
+ggplot(data.df) + geom_point(aes(x=TempC, y=Flux_g.C_glitter.1_d.1, color=GravMoist)) + facet_grid(Site_FEDGbbIowa~Litt_type)
+```
+
+#Break down gravametric moisture sensitivity
+```{r binMoist}
+data.df$GravMoistBin <- cut(data.df$GravMoist, breaks=19)
+ggplot(data.df) + geom_point(aes(x=TempC, y=Flux_g.C_glitter.1_d.1, color=GravMoist)) + facet_wrap(~GravMoistBin)
+
+data.df$GravMoistBin <- cut(data.df$GravMoist, breaks=c(-1, 25, 50, 190))
+ggplot(data.df) + geom_point(aes(x=TempC, y=Flux_g.C_glitter.1_d.1, color=GravMoist)) + facet_grid(Litt_type~GravMoistBin)
+```
+
+#Play with Q10 temperature sensitivity
+```{r Q10crazy}
+
+temp <- data.df
+temp$logFlux <- log(temp$Flux_g.C_glitter.1_d.1)
+temp$logMoist <- log(temp$GravMoist)
+
+temp.lm <- lm(logFlux ~ + I((TempC-15)/10), data=subset(temp, is.finite(logMoist) & is.finite(logFlux)& GravMoist < 50 & GravMoist > 25))
+print(summary(temp.lm))
+
+temp.lm <- lm(logFlux ~ + I((TempC-15)/10), data=subset(temp, is.finite(logMoist) & is.finite(logFlux)& GravMoist < 25))
+print(summary(temp.lm))
+
+ggplot(data.df) + geom_point(aes(x=RH, y=GravMoist, color=Wetness_disc, size=Flux_g.C_glitter.1_d.1)) + facet_wrap(~Event.name)
+```
